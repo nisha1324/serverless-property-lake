@@ -1,0 +1,6 @@
+property_type,standard_sales,median_price,pct_leasehold,pct_new_build,additional_entries,pct_additional
+Semi-detached,21121,278000.0,5.9,5.4,2108,9.1
+Detached,18447,425000.0,2.5,11.4,1004,5.2
+Terraced,18362,245000.0,8.4,2.1,3938,17.7
+Flat/maisonette,10698,240000.0,97.7,5.4,2423,18.5
+Other,0,,,,4264,100.0

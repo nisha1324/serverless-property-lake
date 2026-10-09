@@ -1,0 +1,13 @@
+segment,lag_bucket,sort_key,sales,pct_of_segment
+existing,1 month,1,17870,22.5
+existing,2 months,2,27171,34.2
+existing,3 months,3,3451,4.3
+existing,4-6 months,4,12443,15.7
+existing,7-12 months,7,15463,19.5
+existing,13+ months,13,3042,3.8
+new build,1 month,1,10,0.1
+new build,2 months,2,23,0.3
+new build,3 months,3,50,0.7
+new build,4-6 months,4,175,2.6
+new build,7-12 months,7,4819,70.4
+new build,13+ months,13,1767,25.8

@@ -2,8 +2,8 @@
 -- Window: transfers in the 12 months before the latest release month.
 -- Category A = standard sales at full market value. Category B = additional
 -- price paid entries (repossessions, buy-to-let mortgages, sales to companies,
--- transfers under a power of sale). B is excluded from market prices here, as
--- in HM Land Registry's own statistics, but its share is shown.
+-- transfers under a power of sale). B isn't a standard full-market-value
+-- sale, so it's excluded from market prices here, but its share is shown.
 WITH latest AS (
     SELECT strptime(max(release) || '-01', '%Y-%m-%d') AS release_start FROM changes
 ),

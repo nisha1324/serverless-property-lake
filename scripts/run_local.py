@@ -17,7 +17,6 @@ import sys
 from pathlib import Path
 
 import boto3
-import duckdb
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +25,7 @@ sys.path.insert(0, str(ROOT))
 from lake import config  # noqa: E402
 from lake.handler import lambda_handler  # noqa: E402
 from lake.infra import ensure_buckets, local_aws, s3_put_event  # noqa: E402
+from lake.query import connect_s3, lake_glob  # noqa: E402
 
 RAW = ROOT / "data" / "raw" / "pp-monthly-update.csv"
 META = ROOT / "data" / "raw" / "source.json"
@@ -39,11 +39,10 @@ def lake_listing(s3) -> pd.DataFrame:
 
 
 def query_curated(con, release: str) -> pd.DataFrame:
-    path = f"s3://{config.lake_bucket()}/{config.CURATED_PREFIX}*/*.parquet"
     return con.sql(f"""
         SELECT record_status, count(*) AS rows,
                round(median(price)) AS median_price
-        FROM read_parquet('{path}', hive_partitioning = true)
+        FROM read_parquet('{lake_glob()}', hive_partitioning = true)
         WHERE release = '{release}'
         GROUP BY record_status ORDER BY record_status
     """).df()
@@ -72,11 +71,7 @@ def main() -> None:
         rejected = pd.read_csv(s3.get_object(
             Bucket=config.lake_bucket(), Key=config.quarantine_key(release))["Body"], dtype=str)
 
-        con = duckdb.connect()
-        con.execute("LOAD httpfs")
-        con.execute(f"""CREATE SECRET (TYPE S3, KEY_ID 'local-test', SECRET 'local-test',
-            REGION '{REGION}', ENDPOINT '{endpoint}', URL_STYLE 'path', USE_SSL false)""")
-        by_status = query_curated(con, release)
+        by_status = query_curated(connect_s3(endpoint, REGION), release)
 
     write_summary(source, created, first, second, listing, rejected, by_status)
     print(f"wrote {OUT.relative_to(ROOT)}")

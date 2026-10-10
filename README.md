@@ -99,7 +99,7 @@ Category B entries (repossessions, buy-to-let mortgages, sales to companies) are
 - **Least privilege, tested:** the handler runs on the emulator **with IAM enforcement on**, using only the function's policy, and loads the release. The same credentials are denied when they try to write outside the lake's three prefixes, delete a file, write to the landing bucket, read other landing files or change a bucket policy. The function has no delete permission at all, and the uploader policy can only add files to the monthly prefix.
 - **Small bundle:** the function ships 4 Python files; pandas and pyarrow come from the AWS SDK for pandas managed layer.
 
-**Cost** ([`results/COSTS.md`](results/COSTS.md)), using London prices from the public AWS Price List and a workload measured here (median 2.4 s and 272 MB peak per monthly file, billed at 3× that time to allow for Lambda's smaller CPU share):
+**Cost** ([`results/COSTS.md`](results/COSTS.md)), using London prices from the public AWS Price List and a workload measured here (median 2.4 s and 266 MB peak per monthly file, billed at 3× that time to allow for Lambda's smaller CPU share):
 
 | Line item (per month) | USD |
 |---|---:|

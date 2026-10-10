@@ -86,7 +86,7 @@ The buckets are versioned, so CloudFormation can't delete them until every objec
 
 ## Running cost
 
-From [`results/COSTS.md`](../results/COSTS.md): prices from the public AWS Price List for London, workload measured here (median 2.4 s and 272 MB peak per monthly file, billed at 3× that time to allow for Lambda's slower CPU share).
+From [`results/COSTS.md`](../results/COSTS.md): prices from the public AWS Price List for London, workload measured here (median 2.4 s and 266 MB peak per monthly file, billed at 3× that time to allow for Lambda's slower CPU share).
 
 - **About $0.05 a month** for one release a month, a year of releases kept, and 500 Athena queries. Athena is 91% of that; Lambda compute is under $0.0001 (7 GB-seconds, against an always-free allowance of 400,000).
 - What would move it: query volume and query shape. Ten times the queries is about $0.48. Querying the raw CSVs instead of Parquet costs about 9× as much for the same queries.

@@ -12,12 +12,22 @@ from botocore.exceptions import ClientError
 from lake import config
 
 QUARANTINE_RETENTION_DAYS = 90
+NONCURRENT_VERSION_RETENTION_DAYS = 30
+
+# Keeps versioning from growing storage forever: overwritten versions go after 30 days.
+EXPIRE_OLD_VERSIONS = {
+    "ID": "expire-old-versions",
+    "Filter": {},
+    "Status": "Enabled",
+    "NoncurrentVersionExpiration": {"NoncurrentDays": NONCURRENT_VERSION_RETENTION_DAYS},
+}
 
 
 def ensure_buckets(s3, region: str) -> list[str]:
     """Create the landing and lake buckets if needed and apply the defaults:
     private (public access blocked), encrypted at rest (SSE-S3), versioned
-    (recover from bad overwrites), and quarantine files expiring after 90 days.
+    (recover from bad overwrites, old versions kept 30 days), and quarantine
+    files expiring after 90 days. infra/template.yaml mirrors these settings.
     """
     created = []
     for bucket in (config.landing_bucket(), config.lake_bucket()):
@@ -35,13 +45,17 @@ def ensure_buckets(s3, region: str) -> list[str]:
             "Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]})
         s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
     s3.put_bucket_lifecycle_configuration(
+        Bucket=config.landing_bucket(),
+        LifecycleConfiguration={"Rules": [EXPIRE_OLD_VERSIONS]},
+    )
+    s3.put_bucket_lifecycle_configuration(
         Bucket=config.lake_bucket(),
         LifecycleConfiguration={"Rules": [{
             "ID": "expire-quarantine",
             "Filter": {"Prefix": config.QUARANTINE_PREFIX},
             "Status": "Enabled",
             "Expiration": {"Days": QUARANTINE_RETENTION_DAYS},
-        }]},
+        }, EXPIRE_OLD_VERSIONS]},
     )
     return created
 

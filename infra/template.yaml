@@ -1,0 +1,210 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Serverless property data lake. The HM Land Registry monthly price-paid file
+  lands in S3, the S3 event triggers the ingest Lambda (lake/handler.py), and
+  the Lambda writes validated, address-free Parquet to the lake bucket.
+  Same bucket defaults as lake/infra.py; the function role can only touch the
+  prefixes in lake/config.py. Not deployed from this repo: see docs/DEPLOY.md.
+
+Parameters:
+  PandasLayerArn:
+    Type: String
+    Description: >-
+      AWS SDK for pandas managed layer (provides pandas and pyarrow) for
+      Python 3.12 on arm64 in the deploy region. Region-specific ARNs:
+      https://aws-sdk-pandas.readthedocs.io/en/stable/layers.html
+    Default: arn:aws:lambda:eu-west-2:336392948345:layer:AWSSDKPandas-Python312-Arm64:31
+  MemorySize:
+    Type: Number
+    Description: Lambda memory in MB (see results/COSTS.md for the measured peak).
+    Default: 1024
+    MinValue: 512
+    MaxValue: 10240
+  QuarantineRetentionDays:
+    Type: Number
+    Default: 90
+  NoncurrentVersionRetentionDays:
+    Type: Number
+    Description: How long overwritten object versions are kept for recovery.
+    Default: 30
+
+Resources:
+  # ---------- Storage ----------
+  LandingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-landing-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref NoncurrentVersionRetentionDays
+
+  LakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-lake-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-quarantine
+            Status: Enabled
+            Prefix: quarantine/price_paid/
+            ExpirationInDays: !Ref QuarantineRetentionDays
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref NoncurrentVersionRetentionDays
+
+  # Refuse plain-HTTP access to either bucket.
+  LandingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LandingBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${LandingBucket}"
+              - !Sub "arn:${AWS::Partition}:s3:::${LandingBucket}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  LakeBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LakeBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${LakeBucket}"
+              - !Sub "arn:${AWS::Partition}:s3:::${LakeBucket}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ---------- Compute ----------
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: S3 ObjectCreated on the landing bucket -> validated Parquet in the lake.
+      CodeUri: ../build/function   # made by infra/package.py (lake/ code only)
+      Handler: lake.handler.lambda_handler
+      Runtime: python3.12
+      Architectures: [arm64]
+      MemorySize: !Ref MemorySize
+      Timeout: 300
+      Layers:
+        - !Ref PandasLayerArn
+      Environment:
+        Variables:
+          # Built from the names, not !Ref, to avoid a circular dependency
+          # between the buckets' event configuration and this function.
+          LANDING_BUCKET: !Sub "${AWS::StackName}-landing-${AWS::AccountId}"
+          LAKE_BUCKET: !Sub "${AWS::StackName}-lake-${AWS::AccountId}"
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: ReadMonthlyLandingFiles
+              Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-landing-${AWS::AccountId}/price-paid/monthly/*"
+            - Sid: WriteLakeOutputs
+              Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-lake-${AWS::AccountId}/curated/price_paid_changes/*"
+                - !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-lake-${AWS::AccountId}/quarantine/price_paid/*"
+                - !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-lake-${AWS::AccountId}/_manifests/price_paid/*"
+            - Sid: ReadManifests
+              Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-lake-${AWS::AccountId}/_manifests/price_paid/*"
+            # Without ListBucket, S3 answers a missing manifest with 403 instead
+            # of 404, and the handler would treat a first load as an error.
+            - Sid: ListLakeSoMissingManifestIs404
+              Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-lake-${AWS::AccountId}"
+      Events:
+        MonthlyFile:
+          Type: S3
+          Properties:
+            Bucket: !Ref LandingBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: price-paid/monthly/
+                  - Name: suffix
+                    Value: .csv
+      # S3 invokes Lambda asynchronously. After 2 retries a failed event goes
+      # to an SQS queue (created by SAM) instead of being lost.
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+
+  IngestFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${IngestFunction}"
+      RetentionInDays: 90
+
+  # ---------- Access for whoever drops the monthly file ----------
+  LandingUploaderPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Attach to the person or job that uploads the monthly file. Upload only, into the monthly prefix.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: UploadMonthlyFile
+            Effect: Allow
+            Action: s3:PutObject
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${LandingBucket}/price-paid/monthly/*"
+
+Outputs:
+  LandingBucketName:
+    Value: !Ref LandingBucket
+  LakeBucketName:
+    Value: !Ref LakeBucket
+  IngestFunctionName:
+    Value: !Ref IngestFunction
+  LandingUploaderPolicyArn:
+    Value: !Ref LandingUploaderPolicy

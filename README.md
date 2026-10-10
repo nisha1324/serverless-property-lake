@@ -1,8 +1,16 @@
 # Serverless property data lake (S3 + Lambda pattern)
 
-> **Status: in progress.** The ingest layer (landing bucket → Lambda-style handler → validated Parquet lake), SQL analytics over the lake and the AWS deployment template are built, tested and run on the real September 2026 release. Next: final recommendations.
+> **Status: complete.** Built, tested (21 offline tests) and run end to end on HM Land Registry's September 2026 release against a local S3 emulator. It hasn't been deployed to a real AWS account; the [SAM template](infra/template.yaml) and [deploy guide](docs/DEPLOY.md) are ready for that.
 
 **Business question:** an estate agency or property-data team wants fresh sold-price data every month for pricing advice and market reports. How can it land HM Land Registry's monthly file, check it, and make it queryable with SQL, **without running a server or a database**, and without storing more personal address data than it needs?
+
+## TL;DR
+- **The pipeline works and is cheap.** A monthly file (90,867 rows) lands in S3, a Lambda-style handler validates it and writes Parquet, and SQL runs on the Parquet in place. It costs **about $0.05 a month** at London list prices, and Athena queries make up 91% of that.
+- **It's safe to re-run, and the access rules are tested.** A duplicate S3 event is skipped and a re-upload overwrites, so rows are never doubled. Bad rows go to quarantine instead of being dropped. The function's IAM policy was tested with enforcement on: it can't delete anything or write outside the lake.
+- **It stores less personal data than the source.** Street addresses are dropped and postcodes are cut to the sector, and the Parquet is 10.7% of the CSV's size.
+- **The latest months are incomplete when they're published.** 39.0% of existing-home sales and 96.2% of new-build sales in this release completed 4+ / 7+ months earlier. A "latest month" chart would show a slowdown that isn't real.
+- **Pricing insight:** category B entries (repossessions, buy-to-let, company sales) are 17.7–18.5% of terraced and flat entries vs 5.2% of detached. A new-build semi sells for **+11.7%** over existing semis in the same district (51 districts); a new-build detached home sells for only **+1.9%** more.
+- **Main gap:** the lake starts with this release, so none of the 3,095 corrections or 1,488 deletions can be applied yet. Trend reporting needs a one-off historical backfill, which is designed but not built.
 
 This repo builds the standard AWS answer: files land in an S3 bucket, an S3 event triggers a Lambda function, the function validates the file and writes Parquet to a data lake, and analysts query the Parquet in place (Athena-style). Everything runs **offline** against [moto](https://github.com/getmoto/moto), an S3 emulator, so no AWS account or credentials are needed. The handler is ordinary boto3 code, so the same code would run on AWS.
 
@@ -115,6 +123,28 @@ Category B entries (repossessions, buy-to-let mortgages, sales to companies) are
 
 **So what for the business:** the monthly feed costs about 5 cents a month to run, with nothing to patch. The real cost lever is how analysts query it: keep querying Parquet, filter on `release` and select only the columns needed.
 
+## Recommendations
+Ranked by impact on the decisions the data feeds. Each one is tied to a figure measured above.
+
+| # | Recommendation | Why (measured) | Owner |
+|---|---|---|---|
+| 1 | **Mark the last 3 transfer months as provisional** in every market report, and judge new-build activity only on sales at least 12 months old. | 39.0% of existing-home sales and 96.2% of new-build sales arrive 4+ / 7+ months after completion; only 33 new builds were registered within 2 months. | Market research / reporting lead |
+| 2 | **Run the one-off historical backfill before any trend reporting** (yearly files, outside Lambda, as a baseline partition; see [DEPLOY.md](docs/DEPLOY.md#historical-backfill-design-not-built)). | 0 of 3,095 corrections and 0 of 1,488 deletions can be applied today. The backfill adds about $0.14 a month of storage. | Data engineer |
+| 3 | **Price flats and terraced homes on category A sales only**, and report category B volume as its own series (repossessions, investors). | Category B is 18.5% of flat and 17.7% of terraced entries vs 5.2% of detached, so mixing them in would shift those prices most. | Valuations / pricing team |
+| 4 | **Apply a new-build premium to semis, not to detached homes**, and recheck it each quarter as releases accumulate. | Semis: +11.7%, with new builds dearer in 88.2% of 51 districts. Detached: +1.9%, dearer in only 55.3% of 132. Not size-adjusted (see limitations). | Valuations / pricing team |
+| 5 | **Set query rules in Athena:** Parquet tables only, always filter on `release`, select named columns, and set a per-query scan limit on the workgroup. | Athena is 91% of the bill; the same queries on raw CSV cost 9× as much. | Analytics lead |
+| 6 | **Add a CloudWatch alarm on the SQS failure queue** before going live, so a failed month pages someone. | The template sends failed events to the queue after 2 retries, but nothing watches it yet. A silently missing month would distort every report built on it. | Data platform owner |
+| 7 | **Review flagged rows before publishing averages;** use medians, as this repo does. | 293 sales under £10k and 296 at £5M or more are kept but flagged; a handful of £5M+ sales can move a local mean a lot. | Analysts |
+
+## Limitations
+- **Emulated, not deployed.** Everything runs against moto. moto's IAM enforcement covers the identity policies tested here, but not everything real AWS checks (for example SCPs or KMS key policies). Lambda timings were measured on this machine and scaled by 3×, so they're estimates.
+- **One release only.** There's a single monthly file in the lake. So there's no month-on-month trend yet, corrections and deletions can't be applied, and the registration lag is a snapshot of one release rather than a measured "month is now complete" curve.
+- **Price Paid Data has no size, bedroom or condition fields.** The new-build premium compares medians within a postcode district and property type, not like-for-like homes. Flats and terraced homes have too few matched districts (15 and 7) to rely on.
+- **Figures belong to the release they came from.** HM Land Registry replaces the monthly file each month, so a later download gives a different release. `data/raw/source.json` records the SHA-256 of the file used here.
+- **Cost estimate scope:** list prices before any free tier, for Lambda, S3 and Athena only. CloudWatch Logs, the SQS queue, Athena result storage and data transfer are left out; at this volume they should be small, but they weren't measured.
+- **Coverage:** England and Wales only. County figures cover the 15 busiest counties by standard sales.
+- **The handler reads a whole file into memory.** That's fine for the ~16 MB monthly file, but the yearly or complete files need the out-of-Lambda backfill path.
+
 ## How to run
 ```bash
 uv venv && source .venv/bin/activate        # or python -m venv .venv
@@ -136,4 +166,6 @@ No AWS account is needed: `run_local.py` uses dummy credentials against a local 
 - [x] Local end-to-end run + 7 offline tests
 - [x] SQL analytics over the lake: A/C/D change-feed view, registration lag, prices by property type and county, new-build premium (+4 tests)
 - [x] Deployment: AWS SAM template (S3 event → Lambda), least-privilege IAM tested with enforcement on the emulator, deploy and backfill notes, and a monthly cost estimate from AWS's price list (+10 tests)
-- [ ] Findings, recommendations and limitations
+- [x] Findings, recommendations and limitations
+
+Possible extensions: build the historical backfill, add the failure-queue alarm to the template, and load a few more monthly releases to measure how long each transfer month takes to fill in.

@@ -1,6 +1,6 @@
 # Serverless property data lake (S3 + Lambda pattern)
 
-> **Status: in progress.** The ingest layer (landing bucket → Lambda-style handler → validated Parquet lake) and SQL analytics over the lake are built, tested and run on the real September 2026 release. Next: deployment notes (infrastructure template and running costs), then final recommendations.
+> **Status: in progress.** The ingest layer (landing bucket → Lambda-style handler → validated Parquet lake), SQL analytics over the lake and the AWS deployment template are built, tested and run on the real September 2026 release. Next: final recommendations.
 
 **Business question:** an estate agency or property-data team wants fresh sold-price data every month for pricing advice and market reports. How can it land HM Land Registry's monthly file, check it, and make it queryable with SQL, **without running a server or a database**, and without storing more personal address data than it needs?
 
@@ -26,6 +26,8 @@ flowchart LR
 | Local run | `scripts/run_local.py` | Starts the emulator, uploads the file, fires the same event S3 would send (twice), queries the lake with DuckDB and writes [`results/ingest_summary.md`](results/ingest_summary.md). |
 | Query layer | `lake/query.py`, `sql/` | Points DuckDB at the Parquet in S3 (Athena-style), exposes every release as one `changes` view, and runs the six numbered SQL files. |
 | Analytics | `scripts/analyse_lake.py` | Rebuilds the lake on the emulator, runs `sql/` and writes [`results/ANALYTICS.md`](results/ANALYTICS.md), one CSV per query and three charts. |
+| Deployment | `infra/template.yaml`, `infra/package.py` | AWS SAM template for the same buckets, the S3 → Lambda trigger, a least-privilege function role and an upload-only policy, plus the script that bundles the function code. See [`docs/DEPLOY.md`](docs/DEPLOY.md). |
+| Running cost | `scripts/estimate_costs.py` | Prices from the public AWS Price List, workload measured on the emulator → [`results/COSTS.md`](results/COSTS.md). |
 
 ### Design choices
 - **Idempotent by design.** S3 delivers events *at least once*, so a duplicate is normal, not an error. The manifest stores the source file's ETag. The same ETag means skip; a corrected re-upload (new ETag) is reprocessed and overwrites the same keys, so there are never duplicate rows.
@@ -90,6 +92,29 @@ Category B entries (repossessions, buy-to-let mortgages, sales to companies) are
 - Caveats: Price Paid Data has no floor area or age, so this isn't size-adjusted. Because of the lag above, most new-build sales here completed months before most existing-home sales, so if prices rose over the year the premium is understated.
 - So what: for valuations, a new-build *semi* has a measurable premium over existing semis nearby; a new-build *detached* home mostly doesn't.
 
+## Deployment and running cost
+[`infra/template.yaml`](infra/template.yaml) is an AWS SAM template for the whole pipeline; [`docs/DEPLOY.md`](docs/DEPLOY.md) has the deploy steps, an Athena table definition and a backfill design. It hasn't been deployed from this repo (that needs an AWS account), but it is checked offline:
+
+- **Valid template:** cfn-lint passes, including the SAM transform, and a test checks that the template's bucket names, prefixes, event filter and retention settings match the code.
+- **Least privilege, tested:** the handler runs on the emulator **with IAM enforcement on**, using only the function's policy, and loads the release. The same credentials are denied when they try to write outside the lake's three prefixes, delete a file, write to the landing bucket, read other landing files or change a bucket policy. The function has no delete permission at all, and the uploader policy can only add files to the monthly prefix.
+- **Small bundle:** the function ships 4 Python files; pandas and pyarrow come from the AWS SDK for pandas managed layer.
+
+**Cost** ([`results/COSTS.md`](results/COSTS.md)), using London prices from the public AWS Price List and a workload measured here (median 2.4 s and 272 MB peak per monthly file, billed at 3× that time to allow for Lambda's smaller CPU share):
+
+| Line item (per month) | USD |
+|---|---:|
+| Lambda compute and requests (7 GB-seconds) | < $0.0001 |
+| S3 storage, a year of releases in both buckets | $0.0047 |
+| S3 requests | < $0.0001 |
+| Athena, 500 queries each scanning the whole lake | $0.0477 |
+| **Total** | **$0.0525** |
+
+- Athena is 91% of the bill, so query habits matter more than compute. The same 500 queries on the raw CSVs instead of Parquet would cost 9× as much ($0.43), and 10× the queries on Parquet would cost $0.48.
+- Lambda is not a cost driver: 10× slower runs still cost $0.001 a month, and 7 GB-seconds is far inside Lambda's always-free 400,000.
+- A historical backfill (the 5.15 GB complete file, ~0.55 GB as Parquet by a rough estimate) would add about $0.14 a month of storage. It should load the yearly files once, outside Lambda, as a baseline partition (design in [`docs/DEPLOY.md`](docs/DEPLOY.md#historical-backfill-design-not-built)).
+
+**So what for the business:** the monthly feed costs about 5 cents a month to run, with nothing to patch. The real cost lever is how analysts query it: keep querying Parquet, filter on `release` and select only the columns needed.
+
 ## How to run
 ```bash
 uv venv && source .venv/bin/activate        # or python -m venv .venv
@@ -97,7 +122,10 @@ uv pip install -r requirements.txt           # or pip install -r requirements.tx
 python scripts/download_data.py              # ~16 MB → data/raw/ (+ source.json)
 python scripts/run_local.py                  # emulator → ingest → results/ingest_summary.md
 python scripts/analyse_lake.py               # emulator → ingest → SQL over S3 → results/ANALYTICS.md + charts
-pytest                                       # 11 offline tests (moto in-process, local Parquet for the SQL)
+python scripts/estimate_costs.py             # measure the handler, price it → results/COSTS.md
+                                             #   (--refresh-prices re-downloads the AWS Price List)
+cfn-lint infra/template.yaml                 # validate the deployment template
+pytest                                       # 21 offline tests (moto in-process, local Parquet for the SQL)
 ```
 No AWS account is needed: `run_local.py` uses dummy credentials against a local emulator on `127.0.0.1:5055`. DuckDB downloads its `httpfs` extension once, on first run.
 
@@ -107,5 +135,5 @@ No AWS account is needed: `run_local.py` uses dummy credentials against a local 
 - [x] Lambda-style handler: validation, curated Parquet, quarantine, manifest, idempotency
 - [x] Local end-to-end run + 7 offline tests
 - [x] SQL analytics over the lake: A/C/D change-feed view, registration lag, prices by property type and county, new-build premium (+4 tests)
-- [ ] Deployment notes: an infrastructure-as-code template (S3 event → Lambda), IAM least-privilege policy, and a monthly cost estimate
+- [x] Deployment: AWS SAM template (S3 event → Lambda), least-privilege IAM tested with enforcement on the emulator, deploy and backfill notes, and a monthly cost estimate from AWS's price list (+10 tests)
 - [ ] Findings, recommendations and limitations
